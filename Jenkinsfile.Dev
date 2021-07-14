@@ -1,0 +1,125 @@
+//@Library('PSL@master') _
+
+def artifactName = ''
+def repoName = 'https://github.com/saikumar716/python-common-functions.git'
+
+pipeline {
+    agent none
+
+    environment {
+        ASTRO_DEV_REGISTRY='registry.astro-dev.adp.saikumar716.com'
+        ASTRO_RELEASE_NAME='sai-master'
+        ASTRO_SERVICE_ACCOUNT_NAME='svc_d_sai'
+        BUILD_NUMBER="${currentBuild.number}"
+        DBT_BIN_HOME="/home/jenkins/.local/bin"
+        DBT_RELATIVE_PROJ_DIR="dags/dbt"
+    }
+
+    parameters {
+        string(
+            name: 'branchName',
+            defaultValue: 'master',
+            description: 'Branch to deploy to dev' 
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        copyArtifactPermission('*')
+        skipStagesAfterUnstable()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('DEV PreBuild') {
+            agent {
+                label 'centos&&cloud'
+            }
+
+            stages {
+                stage('Bundle Artifacts'){
+                    steps {
+                        script {
+                            git branch: params.branchName, url: repoName, credentialsId: 'service_accnt_id'
+                            def commitShortHash = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                            artifactName = "artifacts-${commitShortHash}-${BUILD_NUMBER}.tgz"
+                            createArtifactFromRepo(artifactName)
+                        }
+                    }
+                    post {
+                        success {
+                            archiveArtifacts artifacts: "${artifactName}", fingerprint: true
+                            stash includes: "${artifactName}", name: 'artifact'
+                        }
+                    }
+                }
+            }
+
+            post {
+                always() {
+                    deleteDir()
+                }
+            }
+        }
+
+        stage('DEV Deployment') {
+            agent {
+                label "adpts-jenkins-dev"
+            }
+
+            options {
+                skipDefaultCheckout()
+            }
+
+            stages {
+                stage('Pull Artifact to DEV') {
+                    steps {
+                        deleteDir()
+                        unstash 'artifact'
+                        sh "tar -zxvf ${artifactName}"
+                    }
+                }
+
+                stage('Deploy') {
+
+                    steps {
+                        echo "Deploying to DEV"
+                        runMakeTarget("dbt")
+                        deployAirflowImage(env.ASTRO_DEV_REGISTRY, env.ASTRO_SERVICE_ACCOUNT_NAME)
+                        runMakeTarget("clean")
+                    }
+                }
+            }
+        }
+    }
+}
+
+def createArtifactFromRepo(String artifactName) {
+    withEnv(["TARFILE_NAME=${artifactName}"]) {
+        sh '''
+        touch ${TARFILE_NAME}
+        tar zcvf ${TARFILE_NAME} --exclude='.git' --exclude='.astro' --exclude=${TARFILE_NAME} .
+        '''
+    }
+}
+
+def deployAirflowImage(String registryURL, String registryCredentialID) {
+    withCredentials([string(credentialsId: "${registryCredentialID}", variable: 'astronomerServiceAccountKey')]) {
+        sh "sudo docker build -t ${registryURL}/${ASTRO_RELEASE_NAME}/airflow:ci-${BUILD_NUMBER} ."
+        sh "sudo docker login ${registryURL} -u _ -p ${astronomerServiceAccountKey}"
+        sh "sudo docker push ${registryURL}/${ASTRO_RELEASE_NAME}/airflow:ci-${BUILD_NUMBER}"
+    }
+}
+
+def runMakeTarget(String target) {
+    withEnv(["DBT_PROJECT_DIR=${WORKSPACE}/${DBT_RELATIVE_PROJ_DIR}", "DBT_BIN_HOME=${DBT_BIN_HOME}", "TARGET=${target}"]) {
+        sh '''
+            if [ -d "${DBT_PROJECT_DIR}" ] && [ ! -z $(ls -A "${DBT_PROJECT_DIR}") ]; then
+                export PATH=$PATH:"${DBT_BIN_HOME}"
+                make "${TARGET}"
+            else
+                echo "No dbt projects found."
+            fi
+        '''
+    }
+}
